@@ -1,0 +1,33 @@
+# Grimoire book configuration for the @jennifer/mikrotik documentation.
+
+[book]
+title = "@jennifer/mikrotik"
+description = "A MikroTik RouterOS API client: commands, query words, tagged commands and /listen streams over plain TCP or api-ssl"
+language = "en"
+src = "docs"
+
+[build]
+out = "site"
+clean = true
+jobs = 0
+
+[html]
+theme = "nordic"
+mode = "auto"
+navPosition = "left"
+tocPosition = "right"
+tocDepth = 3
+sectionNumbers = true
+titleUrl = "https://jennifer-language.github.io/deck-mikrotik/"
+repoUrl = "https://github.com/jennifer-language/deck-mikrotik"
+repoLabel = "Source"
+editUrl = "https://github.com/jennifer-language/deck-mikrotik/edit/main/docs/{path}"
+
+[highlight]
+enabled = true
+
+[search]
+enabled = true
+
+[pdf]
+enabled = false
