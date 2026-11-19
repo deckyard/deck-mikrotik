@@ -46,13 +46,13 @@ It leaves out:
 
 `MikrotikError` (kind `"mikrotik"`) is the one struct for every error of that
 kind: a `!trap` (`reply` `"trap"`, the trap's `category`, the router's
-`routerMessage`), a `!fatal` (`reply` `"fatal"`), and a refused query word or
-attribute name (`reply` `""`).
+`routerMessage`), a `!fatal` (`reply` `"fatal"`), and a refused query word,
+attribute name or plain-TCP login (`reply` `""`).
 
 The generic kinds go on unchanged: a socket failure (refused, reset,
 unreachable, lookup, certificate) is `net`'s `net.NetError` (kind `"net"`), a
 read past its deadline `"timeout"`, a router closing mid-sentence `"closed"`,
-a word over the cap `"limit"`, and a cancelled task `"cancelled"`. The deck
+a reply over a cap `"limit"`, and a cancelled task `"cancelled"`. The deck
 catches nothing on its way, so none of them is rewrapped.
 
 ## Security and limits
@@ -60,13 +60,21 @@ catches nothing on its way, so none of them is rewrapped.
 - **Certificates are verified by default** on api-ssl. `withCA` pins a
   certificate and still authenticates the router; `insecure` turns
   authentication off.
-- **Plain TCP is cleartext**, credentials included. `options` exists for a
-  loopback or an otherwise secured link.
+- **Plain TCP is cleartext**, credentials included, so `connect` refuses a
+  login over it before dialling unless `allowInsecureAuth` is set (the field
+  `smtp` uses for the same choice). `options` exists for a loopback or an
+  otherwise secured link, where the caller says so.
 - **Deadlines.** Dialling and every read are bounded by 30 seconds, and each
   read clears its deadline on the way out, so it never carries over to the
   next read on the socket.
-- **Word cap.** A word longer than 64 MiB is refused (kind `"limit"`) before
-  anything is allocated for it.
+- **Reply caps.** A word longer than 64 MiB, a sentence of more than 4096
+  words, and a reply (every sentence to `!done`) of more than 262144 words or
+  64 MiB of word text are refused (kind `"limit"`) before the excess is read.
+  The word count is what bounds memory: each word becomes a string in a row
+  map, at over a kilobyte apiece: a reply at the word cap peaked at 320 MB
+  (wide rows) to 370 MB (two-word rows), where a million short words in one
+  sentence took 1.2 GB before the caps.
+  `receiveReply` holds each pushed sentence to the same caps.
 - **A failed login closes the socket.**
 
 ## Testing and validation
@@ -79,7 +87,9 @@ against a response computed apart from the deck, and a refused one), print,
 query and attribute words, `run`'s `=ret=`, a trap followed by a working call,
 a `!fatal`, a word over the cap, tagged commands and a stream ended by
 `/cancel`. A refused connection is shown to arrive as a `net.NetError`, a
-close mid-sentence as `"closed"`. The api-ssl tests use an `httpd` TLS server
+close mid-sentence as `"closed"`. A plain-TCP login is refused before
+dialling without `allowInsecureAuth` and dials with it; a sentence one word
+over the cap, and replies over a small word or byte budget, are `"limit"`. The api-ssl tests use an `httpd` TLS server
 with a test CA: the default options refuse its certificate, `withCA` and
 `insecure` get past the handshake.
 
@@ -88,8 +98,6 @@ router. The examples need one, so CI parses them only.
 
 ## Known limitations and open questions
 
-- A reply's row count and a sentence's word count are not capped; only each
-  word is. A hostile router can make a single reply large.
 - No helper for typed values or for the `?#` query stack beyond passing the
   words through.
 

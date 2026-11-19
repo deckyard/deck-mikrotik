@@ -10,10 +10,12 @@ Every export of `@jennifer/mikrotik`. Background is in
 import "@jennifer/mikrotik/" as mikrotik;
 ```
 
-A `!trap` or `!fatal` reply, a bad query word or attribute name throws a
-`MikrotikError` (kind `"mikrotik"`). A socket failure is `net`'s
-`net.NetError` (kind `"net"`); a deadline, a router closing mid-sentence and a
-word over the 64 MiB cap are kinds `"timeout"`, `"closed"` and `"limit"`.
+A `!trap` or `!fatal` reply, a bad query word or attribute name, and a
+plain-TCP login without `allowInsecureAuth` throw a `MikrotikError` (kind
+`"mikrotik"`). A socket failure is `net`'s `net.NetError` (kind `"net"`); a
+deadline, a router closing mid-sentence and a reply over a cap (a word over 64
+MiB, a sentence over 4096 words, a reply over 262144 words or 64 MiB) are
+kinds `"timeout"`, `"closed"` and `"limit"`.
 
 ## Types
 
@@ -28,6 +30,7 @@ word over the 64 MiB cap are kinds `"timeout"`, `"closed"` and `"limit"`.
 | `tls as bool` | api-ssl |
 | `skipVerify as bool` | accept any certificate (`insecure`) |
 | `caCert as bytes` | a PEM certificate to trust besides the system roots (`withCA`) |
+| `allowInsecureAuth as bool` | log in over plain TCP anyway; default `false`, refused without `tls` |
 
 ### `Session`
 
@@ -51,7 +54,7 @@ Every error of kind `"mikrotik"`.
 
 | Function | Returns | Notes |
 |---|---|---|
-| `mikrotik.options(host, user, password)` | `Options` | plain TCP, port 8728, cleartext |
+| `mikrotik.options(host, user, password)` | `Options` | plain TCP, port 8728, cleartext; `connect` needs `allowInsecureAuth` |
 | `mikrotik.optionsTLS(host, user, password)` | `Options` | api-ssl, port 8729, certificate verified |
 | `mikrotik.withPort(o, port)` | `Options` | another port |
 | `mikrotik.withCA(o, pem)` | `Options` | trust a private CA or pinned certificate |

@@ -37,9 +37,25 @@ def s as mikrotik.Session init mikrotik.connect(mikrotik.withCA(
 ```
 
 `insecure(opts)` accepts any certificate. TLS still encrypts, but anyone on
-the path can pose as the router; use it only on a wire you trust. `options`
-is plain TCP, where the password and every command cross the network in the
-clear.
+the path can pose as the router; use it only on a wire you trust.
+
+`options` is plain TCP (the `api` service, port 8728), where the password and
+every command cross the network in the clear. `connect` refuses to log in
+over it, before dialling, with a `MikrotikError` (kind `"mikrotik"`), unless
+the options set `allowInsecureAuth` - the same field and meaning as in
+`smtp`. Many home-lab routers only have `api` enabled; on a link you trust (a
+lab network, a cable to the router, a VPN) opt in:
+
+```jennifer
+def o as mikrotik.Options init mikrotik.options("192.168.88.1", "admin", "secret");
+$o.allowInsecureAuth = true;   # plaintext on purpose: a trusted lab link
+def s as mikrotik.Session init mikrotik.connect($o);
+```
+
+Better, enable `api-ssl` once on the router (`/certificate add name=api
+common-name=router`, `/certificate sign api`, `/ip service set api-ssl
+certificate=api disabled=no`), export the certificate
+(`/certificate export-certificate api`) and pin it with `withCA` as above.
 
 Login sends the name and password (RouterOS 6.43 and later). A router older
 than 6.43 answers with a challenge, and the deck completes the MD5
@@ -123,7 +139,14 @@ try {
 The generic kinds go on: a refused, reset or unreachable connection, a failed
 lookup and a certificate that does not verify are `net`'s `net.NetError`
 (kind `"net"`); a router silent for 30 seconds is `"timeout"`, one that closes
-mid-sentence `"closed"`, and a word over 64 MiB `"limit"`.
+mid-sentence `"closed"`, and a reply over one of its caps `"limit"`.
+
+A reply - every sentence up to `!done`, so all of `talk`'s rows - may hold at
+most 262144 words and 64 MiB of word text, a sentence 4096 words, a word 64
+MiB. A router that sends more gets kind `"limit"` before the excess is read,
+so a broken or hostile one cannot exhaust memory. The reply is then left
+half-read: close the session. Read a table too large for one reply in parts:
+query words filter its rows on the router, and `.proplist` trims its columns.
 
 ## Runtime
 
