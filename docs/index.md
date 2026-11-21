@@ -36,7 +36,7 @@ def s as mikrotik.Session init mikrotik.connect(mikrotik.withCA(
     mikrotik.optionsTLS("192.168.88.1", "admin", "secret"), $ca));
 ```
 
-`insecure(opts)` accepts any certificate. TLS still encrypts, but anyone on
+`withSkipVerify(opts)` accepts any certificate. TLS still encrypts, but anyone on
 the path can pose as the router; use it only on a wire you trust.
 
 `options` is plain TCP (the `api` service, port 8728), where the password and

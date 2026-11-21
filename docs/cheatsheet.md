@@ -28,7 +28,7 @@ kinds `"timeout"`, `"closed"` and `"limit"`.
 | `user as string` | API user |
 | `password as string` | API password |
 | `tls as bool` | api-ssl |
-| `skipVerify as bool` | accept any certificate (`insecure`) |
+| `skipVerify as bool` | accept any certificate (`withSkipVerify`) |
 | `caCert as bytes` | a PEM certificate to trust besides the system roots (`withCA`) |
 | `allowInsecureAuth as bool` | log in over plain TCP anyway; default `false`, refused without `tls` |
 
@@ -58,7 +58,8 @@ Every error of kind `"mikrotik"`.
 | `mikrotik.optionsTLS(host, user, password)` | `Options` | api-ssl, port 8729, certificate verified |
 | `mikrotik.withPort(o, port)` | `Options` | another port |
 | `mikrotik.withCA(o, pem)` | `Options` | trust a private CA or pinned certificate |
-| `mikrotik.insecure(o)` | `Options` | accept any certificate |
+| `mikrotik.withSkipVerify(o)` | `Options` | accept any certificate |
+| `mikrotik.insecure(o)` | `Options` | deprecated name of `withSkipVerify` |
 | `mikrotik.connect(opts)` | `Session` | dial and log in (MD5 challenge for pre-6.43) |
 | `mikrotik.close(session)` | | close the connection |
 

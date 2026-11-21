@@ -622,7 +622,7 @@ func testApiSslVerifiesTheCertificate() {
     def pem as bytes init convert.bytesFromString("utf-8", TEST_CA);
     def pinned as string init tlsLogin($srv, withCA($base, $pem));
     testing.assertTrue($pinned != "net/tls" and $pinned != "logged in");
-    def any as string init tlsLogin($srv, insecure($base));
+    def any as string init tlsLogin($srv, withSkipVerify($base));
     testing.assertTrue($any != "net/tls" and $any != "logged in");
 }
 
@@ -744,4 +744,9 @@ func testAReplyOverItsBudgetIsLimit() {
     testing.assertEqual(budgetKind($rows, Budget{words: 1000, bytes: 79}), "limit");
     testing.assertEqual(replyBudget().words, MAX_REPLY_WORDS);
     testing.assertEqual(replyBudget().bytes, MAX_REPLY_BYTES);
+}
+
+func testInsecureIsTheOldNameOfWithSkipVerify() {
+    def o as Options;
+    testing.assertEqual(insecure($o), withSkipVerify($o));
 }

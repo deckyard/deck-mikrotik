@@ -58,7 +58,7 @@ catches nothing on its way, so none of them is rewrapped.
 ## Security and limits
 
 - **Certificates are verified by default** on api-ssl. `withCA` pins a
-  certificate and still authenticates the router; `insecure` turns
+  certificate and still authenticates the router; `withSkipVerify` turns
   authentication off.
 - **Plain TCP is cleartext**, credentials included, so `connect` refuses a
   login over it before dialling unless `allowInsecureAuth` is set (the field
@@ -91,7 +91,7 @@ close mid-sentence as `"closed"`. A plain-TCP login is refused before
 dialling without `allowInsecureAuth` and dials with it; a sentence one word
 over the cap, and replies over a small word or byte budget, are `"limit"`. The api-ssl tests use an `httpd` TLS server
 with a test CA: the default options refuse its certificate, `withCA` and
-`insecure` get past the handshake.
+`withSkipVerify` get past the handshake.
 
 The fake follows the RouterOS API documentation; the tests never reach a
 router. The examples need one, so CI parses them only.
