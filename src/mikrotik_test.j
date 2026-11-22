@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # SPDX-FileCopyrightText: Copyright (C) 2026 mplx <mplx@jennifer-lang.dev>
-# pragma-jennifer-version: >=0.26.0
+# pragma-jennifer-version: >=0.27.0
 
 /**
  * White-box tests for the entry module: jennifer test src/mikrotik_test.j
@@ -14,6 +14,7 @@
 use testing;
 use task;
 use httpd;
+use convert;
 
 func hex(b as bytes) {
     return encoding.toText("hex", $b);
@@ -259,7 +260,7 @@ func testAPeerCloseMidSentenceIsClosed() {
     def listener as net.Listener init net.listen("127.0.0.1:0");
     def server as task of null init spawn {
         def conn as net.Conn init net.accept($listener);
-        net.writeBytes($conn, convert.bytesFromString("utf-8", "AB"));
+        net.writeBytes($conn, encoding.encode("utf-8", "AB"));
         net.close($conn);
     };
     def c as net.Conn init net.connect(net.address($listener));
@@ -611,15 +612,15 @@ func tlsLogin(srv as httpd.Server, o as Options) {
 func testApiSslVerifiesTheCertificate() {
     def srv as httpd.Server init httpd.listenTLS(
         "127.0.0.1:0",
-        convert.bytesFromString("utf-8", TEST_LEAF),
-        convert.bytesFromString("utf-8", TEST_LEAF_KEY));
+        encoding.encode("utf-8", TEST_LEAF),
+        encoding.encode("utf-8", TEST_LEAF_KEY));
     defer httpd.shutdown($srv);
     def base as Options init optionsTLS("127.0.0.1", "admin", "pw\r\n\r\n");
     # the system roots lack the test CA
     testing.assertEqual(tlsLogin($srv, $base), "net/tls");
     # pinned or unchecked, the handshake succeeds and the login fails on the
     # HTTP answer (a close or a reset, depending on timing)
-    def pem as bytes init convert.bytesFromString("utf-8", TEST_CA);
+    def pem as bytes init encoding.encode("utf-8", TEST_CA);
     def pinned as string init tlsLogin($srv, withCA($base, $pem));
     testing.assertTrue($pinned != "net/tls" and $pinned != "logged in");
     def any as string init tlsLogin($srv, withSkipVerify($base));

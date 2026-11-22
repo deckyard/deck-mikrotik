@@ -41,7 +41,7 @@ mikrotik.close($s);
 
 ## Requirements
 
-Jennifer 0.26.0 or newer, the default `jennifer` binary (`net`), not
+Jennifer 0.27.0 or newer, the default `jennifer` binary (`net`), not
 `jennifer-tiny`, and a router with the `api` or `api-ssl` service enabled.
 
 ## Development

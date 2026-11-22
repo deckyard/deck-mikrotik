@@ -103,8 +103,8 @@ router. The examples need one, so CI parses them only.
 
 ## Dependencies on the interpreter
 
-- The floor is `>=0.26.0`, the release that deprecates the bundled module
-  (M30.1).
+- The floor is `>=0.27.0`, for the UTF-8 codecs of `encoding.encode` /
+  `decode`; the bundled module is deprecated from 0.26.0 (M30.1).
 - `net` with TLS, read deadlines and `net.NetError` (M28.65); thrown error
   structs (M28.50, M28.53). The `net` capability means the default `jennifer`
   binary only.
