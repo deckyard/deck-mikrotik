@@ -3,7 +3,7 @@
 
 # @jennifer/mikrotik
 
-A client for the MikroTik RouterOS API, the binary protocol RouterOS serves on
+A client for the MikroTik™ RouterOS™ API, the binary protocol RouterOS serves on
 port 8728 (plain TCP) and 8729 (api-ssl). It logs in, runs commands, filters
 on the router with query words, and reads streaming commands. The full API is
 on the [cheatsheet](cheatsheet.md).
@@ -163,3 +163,10 @@ and functions; only the import changes:
 import "mikrotik.j" as mikrotik;              # before
 import "@jennifer/mikrotik/" as mikrotik;     # after: jvc add @jennifer/mikrotik
 ```
+
+## Trademarks
+
+MikroTik™ and RouterOS™ are trademarks of SIA "Mikrotīkls". Other product and
+company names may be trademarks of their respective owners. They are used only
+to identify the products this deck works with. This deck is an independent
+project, not affiliated with, sponsored or endorsed by SIA Mikrotikls.

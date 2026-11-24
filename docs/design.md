@@ -5,7 +5,7 @@
 
 ## Scope
 
-The deck speaks the RouterOS binary API: login (plain, or the MD5 challenge of
+The deck speaks the RouterOS™ binary API: login (plain, or the MD5 challenge of
 routers before 6.43), commands with attribute and query words, tagged
 commands, and streaming commands read reply by reply and stopped with
 `/cancel`. It is the protocol layer; `@deckyard/routeros` builds typed
