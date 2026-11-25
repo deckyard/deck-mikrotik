@@ -26,13 +26,29 @@ It leaves out:
   in the deck ecosystem. The deck is one of the bundled modules that
   `jennifer` moves out (M30.1 in its milestones) and keeps the module's
   surface, so migrating changes only the import.
-- **One socket, read in order.** A synchronous call writes its sentence and
-  reads to its `!done` before returning, so calls on one session must not
-  overlap. A streaming command is read with `receiveReply`, which skips
-  replies whose tag is not the one asked for.
-- **A trap leaves the session usable.** The `!done` that follows a `!trap` is
-  read before the error is thrown; a `!fatal` throws at once, since the router
-  closes the connection.
+- **One socket, one reader, replies routed by tag.** A synchronous call
+  writes its sentence (in one write) and reads to its `!done` before
+  returning, so calls on one session must not overlap. Every read takes only
+  the sentences of its own tag (`""` for an untagged command); sentences of
+  other tags met on the way are held in the session's `pending` channel (a
+  shared handle, so copies of the `Session` see one queue) for the call that
+  reads their tag. A `talk` while a stream runs, and two streams on one
+  session, lose nothing. The queue is capped like a reply (4096 sentences,
+  262144 words, 64 MiB). `cancel` tags its own `/cancel`, and replies to it
+  are dropped wherever they are read; a `!fatal` of any tag ends the call.
+- **A trap leaves the session usable; a half-read reply closes it.** The
+  `!done` that follows a `!trap` is read before the error is thrown. Any
+  other failure while a sentence is written or a reply read (a cap, a
+  deadline, a malformed reply, a `!fatal`) leaves the connection out of step
+  with the protocol, so the session's socket is closed and every later call
+  is kind `"closed"` (`close` on it does nothing). Reading on would take the
+  rest of the failed reply as the next one.
+- **Strict replies.** Every word must be UTF-8: RouterOS stores the bytes a
+  client sent, so a comment typed in a legacy code page is possible, and it is
+  reported (a `MikrotikError` naming the field, after the reply's `!done`)
+  rather than decoded into something else. A length prefix must use its
+  shortest form and not a reserved first byte (`0xF8` and up); an empty
+  sentence and a login challenge that is not 32 hex digits are malformed.
 - **A cancelled stream is not an error.** `receiveReply` takes the trap of
   category `2` (interrupted) that answers `/cancel` as the end of the stream
   and returns `{}`.
@@ -47,7 +63,8 @@ It leaves out:
 `MikrotikError` (kind `"mikrotik"`) is the one struct for every error of that
 kind: a `!trap` (`reply` `"trap"`, the trap's `category`, the router's
 `routerMessage`), a `!fatal` (`reply` `"fatal"`), and a refused query word,
-attribute name or plain-TCP login (`reply` `""`).
+attribute name or plain-TCP login, a reply word that is not UTF-8, and a
+malformed reply (`reply` `""`).
 
 The generic kinds go on unchanged: a socket failure (refused, reset,
 unreachable, lookup, certificate) is `net`'s `net.NetError` (kind `"net"`), a
@@ -64,9 +81,16 @@ catches nothing on its way, so none of them is rewrapped.
   login over it before dialling unless `allowInsecureAuth` is set (the field
   `smtp` uses for the same choice). `options` exists for a loopback or an
   otherwise secured link, where the caller says so.
-- **Deadlines.** Dialling and every read are bounded by 30 seconds, and each
-  read clears its deadline on the way out, so it never carries over to the
-  next read on the socket.
+- **Deadlines.** Dialling is bounded by 30 seconds, and every read by an idle
+  timeout of 30 seconds (a stall). A whole reply must arrive within 5 minutes
+  (`EXCHANGE_TIMEOUT_MS`), so a router trickling bytes inside the idle
+  timeout cannot hold a call open; the deadline is armed once per exchange,
+  not per read. A sentence must be written within 30 seconds, so a router that
+  stops reading cannot block a write. `receiveReply` waits 30 seconds for the
+  next pushed reply; `receiveReplyWithin` takes the wait (0 for none), lifts
+  the idle timeout until the first byte, and leaves the session usable when
+  the wait runs out with nothing read. Once a sentence has begun, it is held
+  to the idle timeout and the exchange deadline.
 - **Reply caps.** A word longer than 64 MiB, a sentence of more than 4096
   words, and a reply (every sentence to `!done`) of more than 262144 words or
   64 MiB of word text are refused (kind `"limit"`) before the excess is read.
@@ -75,6 +99,8 @@ catches nothing on its way, so none of them is rewrapped.
   (wide rows) to 370 MB (two-word rows), where a million short words in one
   sentence took 1.2 GB before the caps.
   `receiveReply` holds each pushed sentence to the same caps.
+- **The session is closed** after a reply over a cap, so its rest is never
+  read.
 - **A failed login closes the socket.**
 
 ## Testing and validation
@@ -87,7 +113,14 @@ against a response computed apart from the deck, and a refused one), print,
 query and attribute words, `run`'s `=ret=`, a trap followed by a working call,
 a `!fatal`, a word over the cap, tagged commands and a stream ended by
 `/cancel`. A refused connection is shown to arrive as a `net.NetError`, a
-close mid-sentence as `"closed"`. A plain-TCP login is refused before
+close mid-sentence as `"closed"`. A scripted router sends raw replies: a reply
+failing half read closes the session; tagged replies interleaved with another
+tag's, a `talk` while a stream runs, and two streams with a trap in one reach
+the right reader; a reply trickled inside the idle timeout hits a short
+exchange deadline; a quiet stream waits past the idle timeout and a short wait
+leaves the session usable; a non-UTF-8 field, an empty sentence, reserved and
+overlong length prefixes and a bad login challenge are `MikrotikError`s. A
+write to a peer that does not read times out. A plain-TCP login is refused before
 dialling without `allowInsecureAuth` and dials with it; a sentence one word
 over the cap, and replies over a small word or byte budget, are `"limit"`. The api-ssl tests use an `httpd` TLS server
 with a test CA: the default options refuse its certificate, `withCA` and

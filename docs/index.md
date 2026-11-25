@@ -94,8 +94,10 @@ def named as list of map of string to string init
 Some commands keep pushing replies (`/interface/monitor-traffic`, `/ping`,
 `/log/listen`). `listen` starts one with a tag and returns the tag;
 `receiveReply` blocks for the next reply carrying it and returns an empty map
-once the stream has ended; `cancel` stops it. Replies to other tags on the
-same session are skipped.
+once the stream has ended; `cancel` stops it. Every call reads only the
+replies of its own tag: replies of other tags read on the way are held for the
+call that reads their tag, so a `talk` while a stream runs, or two streams on
+one session, lose nothing. One task at a time may call into a session.
 
 ```jennifer
 def tag as string init mikrotik.listen($s, "/interface/monitor-traffic", {"interface": "ether1"});
@@ -116,13 +118,22 @@ The router answers a cancel with a `!trap` of category `2` (interrupted) and a
 the reader is raised at `task.wait`, so put the `try` there. `talkTagged` adds
 a tag to a one-shot command and still reads to its `!done`.
 
+`receiveReply` waits 30 seconds for the next reply. A quiet stream
+(`/log/listen`) waits longer with `receiveReplyWithin($s, $tag, timeoutMs)`,
+`0` for no limit. Running out of time is kind `"timeout"` with nothing read,
+so the session stays usable: wait again, or `cancel`.
+
 ## Errors
 
 A `!trap` (the command failed; the session stays usable) or `!fatal` (the
 router closes the connection) throws a `mikrotik.MikrotikError`, kind
 `"mikrotik"`, with the `reply`, the trap's `category` and the router's
-`routerMessage`. A bad query word or attribute name is the same kind, with
-`reply` `""`.
+`routerMessage`. The same kind, with `reply` `""`, is a bad query word or
+attribute name, a reply word that is not UTF-8 (the message names its field;
+thrown after the reply's `!done`, so the session stays usable), and a
+malformed reply: an empty sentence, a length prefix that is reserved (first
+byte `0xF8` and up) or not in its shortest form, or a login challenge that is
+not 32 hex digits.
 
 ```jennifer
 try {
@@ -138,14 +149,21 @@ try {
 
 The generic kinds go on: a refused, reset or unreachable connection, a failed
 lookup and a certificate that does not verify are `net`'s `net.NetError`
-(kind `"net"`); a router silent for 30 seconds is `"timeout"`, one that closes
-mid-sentence `"closed"`, and a reply over one of its caps `"limit"`.
+(kind `"net"`); a deadline is `"timeout"`, a router that closes mid-sentence
+`"closed"`, and a reply over one of its caps `"limit"`. The deadlines: 30
+seconds to dial, 30 seconds of a stalled read, 5 minutes for a whole reply
+(so a router trickling bytes cannot hold a call open), 30 seconds to write a
+sentence.
+
+A failure that leaves a reply half read or a sentence half written (a cap, a
+deadline, a malformed reply, a `!fatal`) closes the session, since the
+connection is out of step; every later call on it is kind `"closed"`, and
+`close` on it does nothing.
 
 A reply - every sentence up to `!done`, so all of `talk`'s rows - may hold at
 most 262144 words and 64 MiB of word text, a sentence 4096 words, a word 64
 MiB. A router that sends more gets kind `"limit"` before the excess is read,
-so a broken or hostile one cannot exhaust memory. The reply is then left
-half-read: close the session. Read a table too large for one reply in parts:
+so a broken or hostile one cannot exhaust memory; the session is closed. Read a table too large for one reply in parts:
 query words filter its rows on the router, and `.proplist` trims its columns.
 
 ## Runtime

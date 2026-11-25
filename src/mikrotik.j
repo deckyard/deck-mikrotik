@@ -25,11 +25,12 @@
  * SECURITY: `mikrotik.options` uses **cleartext** TCP (port 8728), so the
  * credentials and every command are readable on the wire. `connect` refuses to
  * log in over it unless `allowInsecureAuth` is set on the options; use
- * `mikrotik.optionsTLS` (api-ssl, port 8729) on any untrusted network. A
- * `CONNECT_TIMEOUT_MS` deadline bounds the dial and every read; a word is capped
- * at `MAX_WORD_BYTES` (64 MiB), a sentence at `MAX_SENTENCE_WORDS` words and one
- * reply at `MAX_REPLY_WORDS` words and `MAX_REPLY_BYTES` bytes, so a wedged or
- * hostile router cannot hang or OOM the program.
+ * `mikrotik.optionsTLS` (api-ssl, port 8729) on any untrusted network. The
+ * dial, a stalled read, a whole reply and a write each have a deadline; a word is
+ * capped at `MAX_WORD_BYTES` (64 MiB), a sentence at `MAX_SENTENCE_WORDS` words
+ * and one reply at `MAX_REPLY_WORDS` words and `MAX_REPLY_BYTES` bytes, so a
+ * wedged or hostile router cannot hang or OOM the program. A failure that leaves
+ * a reply half read closes the session (later calls are kind `"closed"`).
  * @module mikrotik
  * @example
  * import "@deckyard/mikrotik/" as mikrotik;
@@ -479,7 +480,12 @@ func encodeSentence(words as list of string) {
 
 # writeSentence writes a sentence in one write, within WRITE_TIMEOUT_MS.
 func writeSentence(socket as net.Conn, words as list of string) {
-    net.setWriteDeadline($socket, WRITE_TIMEOUT_MS);
+    writeSentenceWithin($socket, $words, WRITE_TIMEOUT_MS);
+}
+
+# writeSentenceWithin writes a sentence in one write, within `deadlineMs`.
+func writeSentenceWithin(socket as net.Conn, words as list of string, deadlineMs as int) {
+    net.setWriteDeadline($socket, $deadlineMs);
     net.writeBytes($socket, encodeSentence($words));
     net.setWriteDeadline($socket, 0);
 }
@@ -491,7 +497,12 @@ func wordName(raw as bytes, index as int) {
     if (not binary.startsWith($raw, $eq)) {
         return "word {$index}";
     }
-    def end as int init binary.indexOf($raw, $eq, 1, 256);
+    # look for the key's end in its first 256 bytes only
+    def scan as int init len($raw) - 1;
+    if ($scan > 256) {
+        $scan = 256;
+    }
+    def end as int init binary.indexOf($raw, $eq, 1, $scan);
     if ($end <= 1) {
         return "word {$index}";
     }

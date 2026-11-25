@@ -15,6 +15,7 @@ use testing;
 use task;
 use httpd;
 use convert;
+use time;
 
 func hex(b as bytes) {
     return encoding.toText("hex", $b);
@@ -356,7 +357,7 @@ func answer(conn as net.Conn, cmd as list of string) {
         def tw as string init ".tag=" + fieldOf($cmd, "tag");
         writeSentence($conn, ["!trap", "=category=2", "=message=interrupted", $tw]);
         writeSentence($conn, ["!done", $tw]);
-        writeSentence($conn, ["!done"]);
+        writeSentence($conn, ["!done", tagWordOf($cmd)]);
     } elseif ($name == "/interface/monitor") {
         def tw as string init tagWordOf($cmd);
         writeSentence($conn, ["!re", "=name=ether1", "=rx=100", $tw]);
@@ -572,7 +573,8 @@ func testTaggedCommandAndStream() {
 
     def seen as list of list of string init task.wait($router);
     testing.assertEqual($seen[0], ["/interface/print", ".tag=t1"]);
-    testing.assertEqual($seen[3], ["/cancel", "=tag=" + $tag]);
+    testing.assertEqual($seen[3][..2], ["/cancel", "=tag=" + $tag]);
+    testing.assertTrue(strings.startsWith(parseTag($seen[3]), CANCEL_TAG_PREFIX));
 }
 
 func testARefusedConnectionIsANetError() {
@@ -694,10 +696,10 @@ func fullKind(sentences as list of list of string) {
     def server as task of null init spawn {
         return serveSentences($listener, $sentences);
     };
-    def s as Session init Session{socket: net.connect(net.address($listener))};
+    def s as Session init newSession(net.connect(net.address($listener)));
     def kind as string init "ok";
     try {
-        collectReply($s);
+        collectReplyWithin($s, "", replyBudget());
     } catch (e) {
         $kind = $e.kind;
     }
@@ -713,10 +715,10 @@ func budgetKind(sentences as list of list of string, budget as Budget) {
     def server as task of null init spawn {
         return serveSentences($listener, $sentences);
     };
-    def s as Session init Session{socket: net.connect(net.address($listener))};
+    def s as Session init newSession(net.connect(net.address($listener)));
     def kind as string init "ok";
     try {
-        collectReplyWithin($s, $budget);
+        collectReplyWithin($s, "", $budget);
     } catch (e) {
         $kind = $e.kind;
     }
@@ -752,4 +754,350 @@ func testAReplyOverItsBudgetIsLimit() {
 func testInsecureIsTheOldNameOfWithSkipVerify() {
     def o as Options;
     testing.assertEqual(insecure($o), withSkipVerify($o));
+}
+
+# --- a scripted router: canned raw replies ------------------------------------
+
+# rawSentence encodes words as a sentence, as a router writes it.
+func rawSentence(words as list of string) {
+    def parts as list of bytes init [];
+    for (def w in $words) {
+        def raw as bytes init encoding.encode("utf-8", $w);
+        $parts[] = encodeLen(len($raw));
+        $parts[] = $raw;
+    }
+    $parts[] = encodeLen(0);
+    return binary.join($parts);
+}
+
+# rawSentences encodes a run of sentences.
+func rawSentences(sentences as list of list of string) {
+    def parts as list of bytes init [];
+    for (def s in $sentences) {
+        $parts[] = rawSentence($s);
+    }
+    return binary.join($parts);
+}
+
+# scriptRouter accepts one client, answers its login, then answers each command
+# sentence with the next of `replies` (raw bytes) and returns the commands once
+# the client closes or the replies run out.
+func scriptRouter(listener as net.Listener, replies as list of bytes) {
+    def conn as net.Conn init net.accept($listener);
+    defer net.close($conn);
+    def seen as list of list of string init [];
+    readSentence($conn);
+    writeSentence($conn, ["!done"]);
+    for (def r in $replies) {
+        try {
+            $seen[] = readSentence($conn);
+        } catch (e) {
+            return $seen;
+        }
+        net.writeBytes($conn, $r);
+    }
+    try {
+        net.readBytes($conn, 1);
+    } catch (e) { # lint-disable: L103
+    }
+    return $seen;
+}
+
+# scripted starts a scriptRouter on a loopback port and connects to it.
+func scripted(replies as list of bytes) {
+    def listener as net.Listener init net.listen("127.0.0.1:0");
+    spawn {
+        scriptRouter($listener, $replies);
+        net.close($listener);
+    };
+    return connect(localOptions($listener, "pw"));
+}
+
+# kindOfTalk runs `command` and returns the error kind it ends in, or "ok".
+func kindOfTalk(s as Session, command as string) {
+    try {
+        talk($s, $command, {});
+    } catch (e) {
+        return $e.kind;
+    }
+    return "ok";
+}
+
+# A reply that fails half read (here a sentence over the word cap) leaves the
+# rest of it on the socket, so the session is closed: the next call is kind
+# "closed" at once instead of reading the leftover words as a reply.
+func testAFailedReplyClosesTheSession() {
+    def s as Session init scripted([
+        rawSentences([manyWords(4097), ["!done"]]),
+        rawSentences([["!re", "=name=second"], ["!done"]])
+    ]);
+    testing.assertEqual(kindOfTalk($s, "/one"), "limit");
+    testing.assertEqual(kindOfTalk($s, "/two"), "closed");
+    # closing it again does nothing
+    close($s);
+}
+
+# talkTagged collects only the replies carrying its tag; the others are held
+# for the reader of their tag.
+func testTalkTaggedCollectsOnlyItsTag() {
+    def s as Session init scripted([
+        rawSentences([
+            ["!re", "=other=row", ".tag=X"],
+            ["!done", ".tag=X"],
+            ["!re", "=mine=1", ".tag=T"],
+            ["!done", ".tag=T"]
+        ])
+    ]);
+    testing.assertEqual(talkTagged($s, "/ip/print", {}, "T"), [{"mine": "1"}]);
+    testing.assertEqual(receiveReply($s, "X"), {"other": "row"});
+    testing.assertEqual(len(receiveReply($s, "X")), 0);
+    close($s);
+}
+
+# An untagged command run while a stream is open gets only its own reply; the
+# stream's replies read on the way wait for receiveReply.
+func testTalkWhileAStreamRuns() {
+    def listener as net.Listener init net.listen("127.0.0.1:0");
+    defer net.close($listener);
+    def router as task of null init spawn {
+        def conn as net.Conn init net.accept($listener);
+        defer net.close($conn);
+        readSentence($conn);
+        writeSentence($conn, ["!done"]);
+        def stream as list of string init readSentence($conn);
+        def tw as string init tagWordOf($stream);
+        readSentence($conn);
+        writeSentence($conn, ["!re", "=topic=pushed", $tw]);
+        writeSentence($conn, ["!re", "=name=ether1"]);
+        writeSentence($conn, ["!done"]);
+        writeSentence($conn, ["!re", "=topic=later", $tw]);
+        try {
+            net.readBytes($conn, 1);
+        } catch (e) { # lint-disable: L103
+        }
+        return null;
+    };
+    def s as Session init connect(localOptions($listener, "pw"));
+    def tag as string init listen($s, "/log/listen", {});
+    testing.assertEqual(talk($s, "/interface/print", {}), [{"name": "ether1"}]);
+    testing.assertEqual(receiveReply($s, $tag)["topic"], "pushed");
+    testing.assertEqual(receiveReply($s, $tag)["topic"], "later");
+    close($s);
+    task.wait($router);
+}
+
+# Two streams on one session: neither loses the other's replies, and a trap of
+# one does not throw out of the other's receiveReply.
+func testTwoStreamsKeepTheirReplies() {
+    def s as Session init scripted([
+        rawSentences([
+            ["!re", "=b=1", ".tag=B"],
+            ["!trap", "=category=0", "=message=b failed", ".tag=B"],
+            ["!re", "=a=1", ".tag=A"]
+        ])
+    ]);
+    writeSentence($s.socket, ["/x"]);
+    testing.assertEqual(receiveReply($s, "A"), {"a": "1"});
+    testing.assertEqual(receiveReply($s, "B"), {"b": "1"});
+    try {
+        receiveReply($s, "B");
+        throw Error{kind: "missed", message: "B's trap"};
+    } catch (e) {
+        testing.assertEqual($e.kind, "mikrotik");
+        def me as MikrotikError init $e;
+        testing.assertEqual($me.routerMessage, "b failed");
+    }
+    close($s);
+}
+
+# A router that trickles a reply byte by byte (each read well inside the idle
+# timeout) still has to finish it within the exchange deadline.
+func testATricklingReplyHitsTheExchangeDeadline() {
+    def listener as net.Listener init net.listen("127.0.0.1:0");
+    defer net.close($listener);
+    def router as task of null init spawn {
+        def conn as net.Conn init net.accept($listener);
+        defer net.close($conn);
+        readSentence($conn);
+        def reply as bytes init rawSentence(["!done"]);
+        for (def i in 0..len($reply)) {
+            time.sleep(time.fromMilliseconds(150));
+            try {
+                net.writeBytes($conn, $reply[$i..$i + 1]);
+            } catch (e) {
+                return null;
+            }
+        }
+        return null;
+    };
+    def s as Session init newSession(net.connect(net.address($listener)));
+    def t0 as int init time.unixMilliseconds(time.now());
+    try {
+        exchangeWithin($s, ["/ip/print"], "", replyBudget(), 400);
+        throw Error{kind: "missed", message: "the exchange deadline"};
+    } catch (e) {
+        testing.assertEqual($e.kind, "timeout");
+    }
+    testing.assertTrue(time.unixMilliseconds(time.now()) - $t0 < 2000);
+    testing.assertEqual(kindOfTalk($s, "/two"), "closed");
+    task.wait($router);
+}
+
+# A router that stops reading cannot block a write forever.
+func testAStalledWriteTimesOut() {
+    def listener as net.Listener init net.listen("127.0.0.1:0");
+    defer net.close($listener);
+    def router as task of null init spawn {
+        def conn as net.Conn init net.accept($listener);
+        time.sleep(time.fromMilliseconds(1500));
+        net.close($conn);
+        return null;
+    };
+    def c as net.Conn init net.connect(net.address($listener));
+    try {
+        def value as string init encoding.decode("utf-8", binary.make(32000000, 0x78));
+        writeSentenceWithin($c, ["/file/set", "=contents=" + $value], 300);
+        throw Error{kind: "missed", message: "the write deadline"};
+    } catch (e) {
+        testing.assertEqual($e.kind, "timeout");
+    }
+    net.close($c);
+    task.wait($router);
+    testing.assertEqual(WRITE_TIMEOUT_MS, 30000);
+}
+
+# receiveReplyWithin waits as long as asked, past the idle timeout of the
+# session's reads; running out of time is "timeout" and leaves the session
+# usable.
+func testAQuietStreamWaitsAsLongAsAsked() {
+    def listener as net.Listener init net.listen("127.0.0.1:0");
+    defer net.close($listener);
+    def router as task of null init spawn {
+        def conn as net.Conn init net.accept($listener);
+        defer net.close($conn);
+        readSentence($conn);
+        writeSentence($conn, ["!done"]);
+        def tw as string init tagWordOf(readSentence($conn));
+        time.sleep(time.fromMilliseconds(700));
+        writeSentence($conn, ["!re", "=topic=late", $tw]);
+        try {
+            net.readBytes($conn, 1);
+        } catch (e) { # lint-disable: L103
+        }
+        return null;
+    };
+    def s as Session init connect(localOptions($listener, "pw"));
+    # stand in for the 30-second idle timeout of a session's reads
+    net.setIdleTimeout($s.socket, 200);
+    def tag as string init listen($s, "/log/listen", {});
+    try {
+        receiveReplyWithin($s, $tag, 100);
+        throw Error{kind: "missed", message: "the wait"};
+    } catch (e) {
+        testing.assertEqual($e.kind, "timeout");
+    }
+    testing.assertEqual(receiveReplyWithin($s, $tag, 5000)["topic"], "late");
+    close($s);
+    task.wait($router);
+}
+
+func negativeWait() {
+    def o as Session;
+    receiveReplyWithin($o, "t", -1);
+}
+
+func testReceiveReplyWithinRefusesANegativeWait() {
+    testing.assertThrows("negativeWait", "mikrotik");
+}
+
+# A reply word that is not UTF-8 is a MikrotikError naming the field, thrown
+# after the reply's !done, so the session stays usable.
+func testANonUtf8FieldIsAMikrotikError() {
+    def bad as bytes init encoding.encode("utf-8", "=comment=caf");
+    $bad[] = 0xe9;
+    def reply as bytes init binary.join([
+        rawSentence(["!re", "=name=a"]),
+        encodeLen(3),
+        encoding.encode("utf-8", "!re"),
+        encodeLen(len($bad)),
+        $bad,
+        encodeLen(0),
+        rawSentence(["!done"])
+    ]);
+    def s as Session init scripted([$reply, rawSentences([["!re", "=name=b"], ["!done"]])]);
+    try {
+        talk($s, "/ip/print", {});
+        throw Error{kind: "missed", message: "a non-UTF-8 field"};
+    } catch (e) {
+        testing.assertEqual($e.kind, "mikrotik");
+        testing.assertContains($e.message, "field \"comment\" is not UTF-8");
+    }
+    testing.assertEqual(talk($s, "/ip/print", {}), [{"name": "b"}]);
+    close($s);
+}
+
+# A login challenge that is not 16 bytes of hex is a MikrotikError.
+func testABadLoginChallengeIsAMikrotikError() {
+    def listener as net.Listener init net.listen("127.0.0.1:0");
+    defer net.close($listener);
+    def router as task of null init spawn {
+        def conn as net.Conn init net.accept($listener);
+        defer net.close($conn);
+        readSentence($conn);
+        writeSentence($conn, ["!done", "=ret=zz-not-hex"]);
+        try {
+            net.readBytes($conn, 1);
+        } catch (e) { # lint-disable: L103
+        }
+        return null;
+    };
+    try {
+        connect(localOptions($listener, "pw"));
+        throw Error{kind: "missed", message: "a bad challenge"};
+    } catch (e) {
+        testing.assertEqual($e.kind, "mikrotik");
+        testing.assertContains($e.message, "challenge");
+    }
+    task.wait($router);
+}
+
+# rawKind reads one reply of raw bytes and returns the error kind it ends in, or
+# "ok".
+func rawKind(reply as bytes) {
+    def s as Session init scripted([$reply]);
+    def kind as string init kindOfTalk($s, "/ip/print");
+    close($s);
+    return $kind;
+}
+
+# An empty sentence is malformed, not a !done.
+func testAnEmptySentenceIsMalformed() {
+    testing.assertEqual(
+        rawKind(binary.concat(encodeLen(0), rawSentences([["!re", "=n=1"], ["!done"]]))),
+        "mikrotik");
+}
+
+# Length bytes 0xF8 and up are reserved, and a length is sent in its shortest
+# form.
+func testReservedAndLongLengthFormsAreMalformed() {
+    def done as bytes init encoding.encode("utf-8", "!done");
+    testing.assertEqual(rawKind(binary.join([encodeLen(5), $done, encodeLen(0)])), "ok");
+    testing.assertEqual(
+        rawKind(binary.join([encoding.fromText("hex", "f800000005"), $done, encodeLen(0)])),
+        "mikrotik");
+    testing.assertEqual(
+        rawKind(binary.join([encoding.fromText("hex", "8005"), $done, encodeLen(0)])),
+        "mikrotik");
+    testing.assertEqual(
+        rawKind(binary.join([encoding.fromText("hex", "f000000005"), $done, encodeLen(0)])),
+        "mikrotik");
+    testing.assertEqual(minLenOfSize(3), 0x4000);
+}
+
+# A sentence goes out as one buffer: the words and the terminator.
+func testASentenceIsOneBuffer() {
+    testing.assertEqual(
+        hex(encodeSentence(["/a", "=b=c"])),
+        "022f6104" + hex(encoding.encode("utf-8", "=b=c")) + "00");
+    testing.assertEqual(encodeSentence(["/a", "=b=c"]), rawSentence(["/a", "=b=c"]));
 }
