@@ -32,7 +32,7 @@
  * hostile router cannot hang or OOM the program.
  * @module mikrotik
  * @example
- * import "@jennifer/mikrotik/" as mikrotik;
+ * import "@deckyard/mikrotik/" as mikrotik;
  * def o as mikrotik.Options init mikrotik.optionsTLS("192.168.88.1", "admin", "secret");
  * def s as mikrotik.Session init mikrotik.connect($o);
  * def ifaces as list of map of string to string init mikrotik.print($s, "/interface");

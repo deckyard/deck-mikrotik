@@ -1,8 +1,8 @@
-# @jennifer/mikrotik
+# @deckyard/mikrotik
 
-[![test](https://github.com/jennifer-language/deck-mikrotik/actions/workflows/test.yml/badge.svg)](https://github.com/jennifer-language/deck-mikrotik/actions/workflows/test.yml)
-[![Documentation](https://img.shields.io/badge/docs-github%20pages-blue)](https://jennifer-language.github.io/deck-mikrotik/)
-[![release](https://img.shields.io/github/v/release/jennifer-language/deck-mikrotik)](https://github.com/jennifer-language/deck-mikrotik/releases/latest)
+[![test](https://github.com/deckyard/deck-mikrotik/actions/workflows/test.yml/badge.svg)](https://github.com/deckyard/deck-mikrotik/actions/workflows/test.yml)
+[![Documentation](https://img.shields.io/badge/docs-github%20pages-blue)](https://deckyard.github.io/deck-mikrotik/)
+[![release](https://img.shields.io/github/v/release/deckyard/deck-mikrotik)](https://github.com/deckyard/deck-mikrotik/releases/latest)
 
 A [Jennifer](https://jennifer-lang.dev/) deck that talks to MikroTik™ routers
 over the RouterOS™ API (port 8728, or api-ssl on 8729): log in, run commands,
@@ -13,15 +13,18 @@ It was Jennifer's bundled `mikrotik.j` module until 0.27; the surface is the
 same, so moving over changes only the import:
 
 ```jennifer
-import "@jennifer/mikrotik/" as mikrotik;   # was: import "mikrotik.j" as mikrotik;
+import "@deckyard/mikrotik/" as mikrotik;   # was: import "mikrotik.j" as mikrotik;
 ```
 
-**[Documentation](https://jennifer-language.github.io/deck-mikrotik/)**
+Up to 0.3.0 this deck was `@jennifer/mikrotik`. To switch, change the `[decks]`
+entry to `"@deckyard/mikrotik" = "^0.4.0"` and the imports to `"@deckyard/mikrotik/"`.
+
+**[Documentation](https://deckyard.github.io/deck-mikrotik/)**
 
 ## Install
 
 ```sh
-jvc add @jennifer/mikrotik
+jvc add @deckyard/mikrotik
 ```
 
 This vendors the deck to `vendor/<scope>/mikrotik/`. Without `jvc`, unpack the
@@ -30,7 +33,7 @@ This vendors the deck to `vendor/<scope>/mikrotik/`. Without `jvc`, unpack the
 ## Usage
 
 ```jennifer
-import "@jennifer/mikrotik/" as mikrotik;
+import "@deckyard/mikrotik/" as mikrotik;
 
 def s as mikrotik.Session init mikrotik.connect(mikrotik.optionsTLS("192.168.88.1", "admin", "secret"));
 for (def iface in mikrotik.print($s, "/interface")) {

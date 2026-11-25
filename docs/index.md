@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: LGPL-3.0-only -->
 <!-- SPDX-FileCopyrightText: Copyright (C) 2026 mplx <mplx@jennifer-lang.dev> -->
 
-# @jennifer/mikrotik
+# @deckyard/mikrotik
 
 A client for the MikroTik™ RouterOS™ API, the binary protocol RouterOS serves on
 port 8728 (plain TCP) and 8729 (api-ssl). It logs in, runs commands, filters
@@ -13,7 +13,7 @@ on the [cheatsheet](cheatsheet.md).
 Snippets assume this import:
 
 ```jennifer
-import "@jennifer/mikrotik/" as mikrotik;
+import "@deckyard/mikrotik/" as mikrotik;
 ```
 
 The trailing slash resolves to the entry module.
@@ -153,6 +153,15 @@ query words filter its rows on the router, and `.proplist` trims its columns.
 Needs `net`, so it runs on the default `jennifer` binary. `jennifer-tiny` has
 no network driver.
 
+## Moving from `@jennifer/mikrotik`
+
+Up to 0.3.0 this deck was `@jennifer/mikrotik`. Change the `[decks]` entry to
+`"@deckyard/mikrotik" = "^0.4.0"` and the imports:
+
+```jennifer
+import "@deckyard/mikrotik/" as mikrotik;
+```
+
 ## Moving from the standard library module
 
 Jennifer has bundled `mikrotik` (`modules/mikrotik.j`) since 0.18.0. The module
@@ -161,7 +170,7 @@ and functions; only the import changes:
 
 ```jennifer
 import "mikrotik.j" as mikrotik;              # before
-import "@jennifer/mikrotik/" as mikrotik;     # after: jvc add @jennifer/mikrotik
+import "@deckyard/mikrotik/" as mikrotik;     # after: jvc add @deckyard/mikrotik
 ```
 
 ## Trademarks

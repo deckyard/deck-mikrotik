@@ -3,11 +3,11 @@
 
 # mikrotik cheatsheet
 
-Every export of `@jennifer/mikrotik`. Background is in
+Every export of `@deckyard/mikrotik`. Background is in
 [the introduction](index.md).
 
 ```jennifer
-import "@jennifer/mikrotik/" as mikrotik;
+import "@deckyard/mikrotik/" as mikrotik;
 ```
 
 A `!trap` or `!fatal` reply, a bad query word or attribute name, and a
