@@ -1,6 +1,6 @@
 [package]
 name = "@deckyard/mikrotik"
-version = "0.4.0"
+version = "0.5.0"
 description = "A MikroTik RouterOS API client: commands, query words, tagged commands and /listen streams over plain TCP or api-ssl"
 license = "LGPL-3.0-only"
 authors = ["mplx <mplx@jennifer-lang.dev>"]
@@ -16,4 +16,4 @@ manual = "https://deckyard.github.io/deck-mikrotik/"
 
 # Only the default binary: `jennifer-tiny` has no `net` capability.
 [engines]
-jennifer = ">=0.27.0"
+jennifer = ">=0.28.0"

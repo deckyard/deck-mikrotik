@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # SPDX-FileCopyrightText: Copyright (C) 2026 mplx <mplx@jennifer-lang.dev>
-# pragma-jennifer-version: >=0.27.0
+# pragma-jennifer-version: >=0.28.0
 # pragma-jennifer-capability: net
 
 /**
@@ -45,6 +45,8 @@ use maps;
 use hash;
 use encoding;
 use uuid;
+use channel;
+use time;
 
 /**
  * Connection options. `host` may be an IP or a DNS hostname (it is resolved when
@@ -75,17 +77,18 @@ export def struct Options {
 };
 
 /**
- * An open, logged-in API session.
+ * An open, logged-in API session. Copies share the connection and the replies
+ * held for later. One task at a time may call into a session: calls on it must
+ * not overlap.
  * @field socket {net.Conn} the underlying (plain or TLS) connection
+ * @field pending {channel of Sentence} internal: replies of other tags read
+ *   while waiting for a reply, held for the call that reads their tag
+ * @field pendingLeft {channel of Budget} internal: what `pending` may still hold
  */
 export def struct Session {
-    socket as net.Conn
-};
-
-# One command's collected reply (private): the `!re` rows and the `!done` ret.
-def struct Reply {
-    rows as list of map of string to string,
-    ret as string
+    socket as net.Conn,
+    pending as channel of Sentence,
+    pendingLeft as channel of Budget
 };
 
 /**
@@ -139,6 +142,11 @@ func fieldOr(fields as map of string to string, key as string) {
 
 # replyError throws the MikrotikError of a `!trap` or `!fatal` sentence's fields.
 func replyError(reply as string, fields as map of string to string) {
+    throw replyErrorOf($reply, $fields);
+}
+
+# replyErrorOf is the MikrotikError of a `!trap` or `!fatal` sentence's fields.
+func replyErrorOf(reply as string, fields as map of string to string) {
     def text as string init "";
     if (maps.has($fields, "message")) {
         $text = $fields["message"];
@@ -154,7 +162,7 @@ func replyError(reply as string, fields as map of string to string) {
             $shown = "connection error";
         }
     }
-    throw MikrotikError{
+    return MikrotikError{
         kind: "mikrotik",
         message: "mikrotik: !" + $reply + ": " + $shown,
         reply: $reply,
@@ -163,10 +171,15 @@ func replyError(reply as string, fields as map of string to string) {
     };
 }
 
-# Network timeout (ms) applied to the dial and to every read, so a blackholed or
-# mid-sentence router fails instead of hanging the program forever (the RouterOS
-# API has no framing that would otherwise bound a read).
+# Deadlines (ms). The dial is bounded by CONNECT_TIMEOUT_MS. Every read stalls
+# for at most IDLE_TIMEOUT_MS, and a whole reply (every sentence up to `!done`,
+# or one pushed sentence of a stream) must arrive within EXCHANGE_TIMEOUT_MS, so
+# a router that trickles bytes cannot hold a call open. A sentence must be
+# written within WRITE_TIMEOUT_MS.
 def const CONNECT_TIMEOUT_MS as int init 30000;
+def const IDLE_TIMEOUT_MS as int init 30000;
+def const EXCHANGE_TIMEOUT_MS as int init 300000;
+def const WRITE_TIMEOUT_MS as int init 30000;
 
 # Cap on a server-declared word length (64 MiB, the tree-wide house rule). The
 # API length prefix is up to a 32-bit value read straight off the wire; without
@@ -183,16 +196,28 @@ def const MAX_SENTENCE_WORDS as int init 4096;
 def const MAX_REPLY_WORDS as int init 262144;
 def const MAX_REPLY_BYTES as int init 67108864;
 
+# Caps on the sentences of other tags held for later (see `Session`): their
+# number, and their words and bytes together (the reply caps again).
+def const MAX_PENDING_SENTENCES as int init 4096;
+
+# The tag prefix of `cancel`'s own `/cancel` sentence; replies carrying it are
+# dropped wherever they are read.
+def const CANCEL_TAG_PREFIX as string init "mikrotik-cancel-";
+
 # Budget is what the rest of a reply may still hold (private).
 def struct Budget {
     words as int,
     bytes as int
 };
 
-# Sentence is one sentence read off the wire and its word bytes (private).
+# Sentence is one sentence read off the wire (private): its words, their bytes,
+# its `.tag` ("" for none), and `bad`, the first word that was not UTF-8 ("" when
+# every word decoded; such a word is held as "").
 def struct Sentence {
     words as list of string,
-    bytes as int
+    bytes as int,
+    tag as string,
+    bad as string
 };
 
 func replyBudget() {
@@ -201,6 +226,11 @@ func replyBudget() {
 
 func overCap(msg as string) {
     throw Error{kind: "limit", message: "mikrotik: " + $msg};
+}
+
+# malformed throws the MikrotikError of a reply that breaks the wire format.
+func malformed(msg as string) {
+    fail("malformed reply: " + $msg);
 }
 
 # checkWordLen rejects a server-declared word length outside [0, MAX_WORD_BYTES]
@@ -305,21 +335,11 @@ export func withSkipVerify(o as Options) {
 
 # --- byte + word codec (private) --------------------------------------------
 
-func appendBytes(dst as bytes, src as bytes) {
-    return binary.concat($dst, $src);
-}
-
+# readN reads exactly `n` bytes. The deadlines are armed by the caller.
 func readN(socket as net.Conn, n as int) {
     def parts as list of bytes init [];
     def got as int init 0;
-    # Clear the read deadline on every exit path (normal return, and the throw
-    # from a mid-sentence close), so the bounded read window armed below never
-    # leaks a stale deadline to a later read on this socket - which would otherwise
-    # inherit it and spuriously time out. `defer` captures $socket now and runs
-    # `net.setReadDeadline($socket, 0)` when this block exits (0 clears it).
-    defer net.setReadDeadline($socket, 0);
     while ($got < $n) {
-        net.setReadDeadline($socket, CONNECT_TIMEOUT_MS);
         def chunk as bytes init net.readBytes($socket, $n - $got);
         if (len($chunk) == 0) {
             throw Error{kind: "closed", message: "mikrotik: connection closed mid-sentence"};
@@ -377,6 +397,24 @@ func lenPrefixSize(head as int) {
     return 5;
 }
 
+# minLenOfSize is the smallest length a prefix of `size` bytes may carry: a
+# shorter one has a shorter (canonical) form.
+func minLenOfSize(size as int) {
+    if ($size == 2) {
+        return 0x80;
+    }
+    if ($size == 3) {
+        return 0x4000;
+    }
+    if ($size == 4) {
+        return 0x200000;
+    }
+    if ($size == 5) {
+        return 0x10000000;
+    }
+    return 0;
+}
+
 # decodeLen decodes the length prefix that starts at `off` in `buf`.
 func decodeLen(buf as bytes, off as int) {
     def head as int init $buf[$off];
@@ -398,41 +436,100 @@ func decodeLen(buf as bytes, off as int) {
     return ($buf[$off + 1] << 24) | ($buf[$off + 2] << 16) | ($buf[$off + 3] << 8) | $buf[$off + 4];
 }
 
+# readLenAfter reads the rest of a word length prefix whose first byte `head`
+# was already read, and decodes it. The API reserves first bytes 0xF8 and up
+# (control bytes), and a length is always sent in its shortest form; anything
+# else is malformed.
+func readLenAfter(socket as net.Conn, head as int) {
+    if ($head >= 0xf8) {
+        def hb as bytes;
+        $hb[] = $head;
+        malformed("reserved length byte 0x" + encoding.toText("hex", $hb));
+    }
+    def size as int init lenPrefixSize($head);
+    if ($size == 1) {
+        return $head;
+    }
+    def buf as bytes;
+    $buf[] = $head;
+    $buf = binary.concat($buf, readN($socket, $size - 1));
+    def n as int init decodeLen($buf, 0);
+    if ($n < minLenOfSize($size)) {
+        malformed("length {$n} not in its shortest form");
+    }
+    return $n;
+}
+
 # readLen reads and decodes a word length prefix off the socket.
 func readLen(socket as net.Conn) {
-    def buf as bytes init readN($socket, 1);
-    def size as int init lenPrefixSize($buf[0]);
-    if ($size > 1) {
-        $buf = appendBytes($buf, readN($socket, $size - 1));
-    }
-    return decodeLen($buf, 0);
+    return readLenAfter($socket, readN($socket, 1)[0]);
 }
 
-# writeWord writes one length-prefixed word.
-func writeWord(socket as net.Conn, word as string) {
-    def raw as bytes init encoding.encode("utf-8", $word);
-    def out as bytes init encodeLen(len($raw));
-    net.writeBytes($socket, appendBytes($out, $raw));
-}
-
-# writeSentence writes a run of words plus the zero-length terminator.
-func writeSentence(socket as net.Conn, words as list of string) {
+# encodeSentence encodes a run of words plus the zero-length terminator.
+func encodeSentence(words as list of string) {
+    def parts as list of bytes init [];
     for (def w in $words) {
-        writeWord($socket, $w);
+        def raw as bytes init encoding.encode("utf-8", $w);
+        $parts[] = encodeLen(len($raw));
+        $parts[] = $raw;
     }
-    net.writeBytes($socket, encodeLen(0));
+    $parts[] = encodeLen(0);
+    return binary.join($parts);
 }
 
-# readSentenceWithin reads words until the zero-length terminator. Each length
-# is checked before its word is read: past MAX_SENTENCE_WORDS words, or past what
-# is `left` of the reply's budget, it throws kind "limit".
-func readSentenceWithin(socket as net.Conn, left as Budget) {
+# writeSentence writes a sentence in one write, within WRITE_TIMEOUT_MS.
+func writeSentence(socket as net.Conn, words as list of string) {
+    net.setWriteDeadline($socket, WRITE_TIMEOUT_MS);
+    net.writeBytes($socket, encodeSentence($words));
+    net.setWriteDeadline($socket, 0);
+}
+
+# wordName names a word that is not UTF-8 for an error: the field of an
+# `=key=value` word when its key decodes, else its position.
+func wordName(raw as bytes, index as int) {
+    def eq as bytes init encoding.encode("utf-8", "=");
+    if (not binary.startsWith($raw, $eq)) {
+        return "word {$index}";
+    }
+    def end as int init binary.indexOf($raw, $eq, 1, 256);
+    if ($end <= 1) {
+        return "word {$index}";
+    }
+    try {
+        return "field \"" + encoding.decode("utf-8", $raw[1..$end]) + "\"";
+    } catch (e) {
+        if ($e.kind != "encoding") {
+            throw $e;
+        }
+    }
+    return "word {$index}";
+}
+
+# readSentenceAfter reads words until the zero-length terminator; `head` is
+# the first byte of the first length prefix when the caller already read it,
+# else -1. Each length is checked before its word is read: past
+# MAX_SENTENCE_WORDS words, or past what is `left` of the reply's budget, it
+# throws kind "limit". A word that is not UTF-8 is held as "" and named in
+# `bad`, so the caller can finish the reply before it throws.
+func readSentenceAfter(socket as net.Conn, left as Budget, head as int) {
     def words as list of string init [];
     def size as int init 0;
+    def tag as string init "";
+    def bad as string init "";
+    def first as int init $head;
     while (true) {
-        def n as int init readLen($socket);
+        def n as int init 0;
+        if ($first >= 0) {
+            $n = readLenAfter($socket, $first);
+            $first = -1;
+        } else {
+            $n = readLen($socket);
+        }
         if ($n == 0) {
-            return Sentence{words: $words, bytes: $size};
+            if (len($words) == 0) {
+                malformed("empty sentence");
+            }
+            return Sentence{words: $words, bytes: $size, tag: $tag, bad: $bad};
         }
         checkWordLen($n);
         def count as int init len($words);
@@ -445,9 +542,29 @@ func readSentenceWithin(socket as net.Conn, left as Budget) {
         if ($size + $n > $left.bytes) {
             overCap("a reply exceeds the cap of {MAX_REPLY_BYTES} bytes");
         }
-        $words[] = encoding.decode("utf-8", readN($socket, $n));
+        def raw as bytes init readN($socket, $n);
+        def word as string init "";
+        try {
+            $word = encoding.decode("utf-8", $raw);
+        } catch (e) {
+            if ($e.kind != "encoding") {
+                throw $e;
+            }
+            if ($bad == "") {
+                $bad = wordName($raw, $count);
+            }
+        }
+        if (strings.startsWith($word, ".tag=")) {
+            $tag = $word[5..];
+        }
+        $words[] = $word;
         $size = $size + $n;
     }
+}
+
+# readSentenceWithin reads one sentence within `left`.
+func readSentenceWithin(socket as net.Conn, left as Budget) {
+    return readSentenceAfter($socket, $left, -1);
 }
 
 # readSentence reads one sentence on its own, within a whole reply's budget.
@@ -544,54 +661,202 @@ func resolveTag(tag as string) {
     return $tag;
 }
 
-# collectReply reads reply sentences until `!done`, collecting `!re` rows and the
-# `!done` ret; a `!trap` / `!fatal` throws. Shared by the untagged `exchange` and
-# the tagged `talkTagged` (both bounded, one-shot commands; a streaming command
-# never reaches `!done` and is read with `receiveReply` instead). The reply as a
-# whole is held to replyBudget().
-func collectReply(session as Session) {
-    return collectReplyWithin($session, replyBudget());
+# --- session state (private) ------------------------------------------------
+
+# newSession wraps a connected socket: no held sentences, the full pending
+# budget.
+func newSession(socket as net.Conn) {
+    def s as Session init Session{
+        socket: $socket,
+        pending: channel.make(MAX_PENDING_SENTENCES),
+        pendingLeft: channel.make(1)
+    };
+    channel.send($s.pendingLeft, replyBudget());
+    return $s;
 }
 
-# collectReplyWithin is collectReply held to `budget`, charged sentence by
-# sentence (the tests pass a small one).
-func collectReplyWithin(session as Session, budget as Budget) {
+# abandon closes a session whose connection is out of step with the protocol
+# (a reply only partly read, a sentence only partly written): every later call
+# on it throws kind "closed".
+func abandon(session as Session) {
+    try {
+        net.close($session.socket);
+    } catch (e) {
+        if ($e.kind != "closed") {
+            throw $e;
+        }
+    }
+}
+
+# hold keeps a sentence of another tag for the call that reads that tag. Past
+# MAX_PENDING_SENTENCES sentences, or the reply caps for all of them, it throws
+# kind "limit".
+func hold(session as Session, s as Sentence) {
+    if (channel.len($session.pending) >= MAX_PENDING_SENTENCES) {
+        overCap("more than {MAX_PENDING_SENTENCES} sentences of other tags are waiting");
+    }
+    def left as Budget init channel.recv($session.pendingLeft);
+    def fits as bool init len($s.words) <= $left.words and $s.bytes <= $left.bytes;
+    if ($fits) {
+        $left.words = $left.words - len($s.words);
+        $left.bytes = $left.bytes -$s.bytes;
+    }
+    channel.send($session.pendingLeft, $left);
+    if (not $fits) {
+        overCap("the sentences of other tags waiting exceed the reply caps");
+    }
+    channel.send($session.pending, $s);
+}
+
+# taken is a held sentence looked up by tag (private).
+def struct Taken {
+    found as bool,
+    sentence as Sentence
+};
+
+# takeHeld removes and returns the oldest held sentence for `tag` (any tag when
+# `all`), keeping the others in order.
+func takeHeld(session as Session, tag as string, all as bool) {
+    def out as Taken;
+    def n as int init channel.len($session.pending);
+    if ($n == 0) {
+        return $out;
+    }
+    for (def i in 0..$n) {
+        def s as Sentence init channel.recv($session.pending);
+        if (not $out.found and ($all or $s.tag == $tag)) {
+            $out.found = true;
+            $out.sentence = $s;
+        } else {
+            channel.send($session.pending, $s);
+        }
+    }
+    if ($out.found) {
+        def left as Budget init channel.recv($session.pendingLeft);
+        $left.words = $left.words + len($out.sentence.words);
+        $left.bytes = $left.bytes + $out.sentence.bytes;
+        channel.send($session.pendingLeft, $left);
+    }
+    return $out;
+}
+
+# nextFor returns the next sentence for `tag` (any when `all`): a held one, else
+# read off the wire, holding the sentences of other tags met on the way. The
+# replies to `cancel`'s own `/cancel` are dropped.
+func nextFor(session as Session, tag as string, all as bool, left as Budget) {
+    def held as Taken init takeHeld($session, $tag, $all);
+    if ($held.found) {
+        return $held.sentence;
+    }
+    while (true) {
+        def s as Sentence init readSentenceWithin($session.socket, $left);
+        # A !fatal ends every command on the session, whatever its tag.
+        if ($all or $s.tag == $tag or $s.words[0] == "!fatal") {
+            return $s;
+        }
+        if (not strings.startsWith($s.tag, CANCEL_TAG_PREFIX)) {
+            hold($session, $s);
+        }
+    }
+}
+
+# --- replies (private) ------------------------------------------------------
+
+# One command's collected reply (private): the `!re` rows, the `!done` ret, and
+# the error to throw once the reply was read to its `!done` (a `!trap`, or a
+# word that is not UTF-8).
+def struct Reply {
+    rows as list of map of string to string,
+    ret as string,
+    failed as bool,
+    failure as MikrotikError
+};
+
+# collectReplyWithin reads the sentences tagged `tag` ("" for an untagged
+# command) to `!done`, held to `budget`, charged sentence by sentence (the tests
+# pass a small one). Sentences of other tags are held for their readers. A
+# `!trap`, or a word that is not UTF-8, is returned as the reply's failure once
+# its `!done` is read; a `!fatal` throws at once.
+func collectReplyWithin(session as Session, tag as string, budget as Budget) {
     def left as Budget init $budget;
+    def out as Reply;
     def rows as list of map of string to string init [];
-    def ret as string init "";
+    def bad as string init "";
     def trapFields as map of string to string init {};
     def trapped as bool init false;
     def done as bool init false;
     repeat {
-        def got as Sentence init readSentenceWithin($session.socket, $left);
+        def got as Sentence init nextFor($session, $tag, false, $left);
         def sentence as list of string init $got.words;
         $left.words = $left.words - len($sentence);
         $left.bytes = $left.bytes -$got.bytes;
-        if (len($sentence) == 0) {
+        if ($bad == "") {
+            $bad = $got.bad;
+        }
+        def reply as string init $sentence[0];
+        def fields as map of string to string init parseFields($sentence);
+        if ($reply == "!re") {
+            $rows[] = $fields;
+        } elseif ($reply == "!done") {
+            $out.ret = fieldOr($fields, "ret");
             $done = true;
-        } else {
-            def reply as string init $sentence[0];
-            def fields as map of string to string init parseFields($sentence);
-            if ($reply == "!re") {
-                $rows[] = $fields;
-            } elseif ($reply == "!done") {
-                $ret = fieldOr($fields, "ret");
-                $done = true;
-            } elseif ($reply == "!trap") {
-                # A trap is followed by a !done; record it and keep reading so
-                # the trailing !done is consumed before we raise.
-                $trapped = true;
-                $trapFields = $fields;
-            } elseif ($reply == "!fatal") {
-                # A fatal closes the connection - no !done follows, so raise now.
-                replyError("fatal", $fields);
-            }
+        } elseif ($reply == "!trap") {
+            # A trap is followed by a !done; record it and keep reading so
+            # the trailing !done is consumed before we raise.
+            $trapped = true;
+            $trapFields = $fields;
+        } elseif ($reply == "!fatal") {
+            # A fatal closes the connection - no !done follows, so raise now.
+            replyError("fatal", $fields);
         }
     } until ($done);
+    $out.rows = $rows;
     if ($trapped) {
-        replyError("trap", $trapFields);
+        $out.failed = true;
+        $out.failure = replyErrorOf("trap", $trapFields);
+    } elseif ($bad != "") {
+        $out.failed = true;
+        $out.failure = notUtf8($bad);
     }
-    return Reply{rows: $rows, ret: $ret};
+    return $out;
+}
+
+# notUtf8 is the MikrotikError of a reply word that is not UTF-8.
+func notUtf8(what as string) {
+    return MikrotikError{
+        kind: "mikrotik",
+        message: "mikrotik: reply " + $what + " is not UTF-8",
+        reply: "",
+        category: "",
+        routerMessage: ""
+    };
+}
+
+# exchangeWithin sends `words` and collects the reply tagged `tag` within
+# `budget` and `deadlineMs` (the whole reply). A failure on the way abandons
+# the session, whose socket is then out of step; a `!trap` or a word that is
+# not UTF-8 throws after the `!done`, with the session still usable.
+func exchangeWithin(
+    session as Session,
+    words as list of string,
+    tag as string,
+    budget as Budget,
+    deadlineMs as int) {
+    def r as Reply;
+    try {
+        writeSentence($session.socket, $words);
+        net.setReadDeadline($session.socket, $deadlineMs);
+        $r = collectReplyWithin($session, $tag, $budget);
+        net.setReadDeadline($session.socket, 0);
+    } catch (e) {
+        abandon($session);
+        throw $e;
+    }
+    if ($r.failed) {
+        def failure as MikrotikError init $r.failure;
+        throw $failure;
+    }
+    return $r;
 }
 
 # exchange sends a command and collects its reply to `!done`.
@@ -600,19 +865,41 @@ func exchange(
     command as string,
     attrs as map of string to string,
     queries as list of string) {
-    writeSentence($session.socket, buildWords($command, $attrs, $queries));
-    return collectReply($session);
+    def words as list of string init buildWords($command, $attrs, $queries);
+    return exchangeWithin($session, $words, "", replyBudget(), EXCHANGE_TIMEOUT_MS);
+}
+
+# send writes a sentence that is not answered here; a failed write abandons the
+# session.
+func send(session as Session, words as list of string) {
+    try {
+        writeSentence($session.socket, $words);
+    } catch (e) {
+        abandon($session);
+        throw $e;
+    }
 }
 
 # --- login (private) --------------------------------------------------------
 
 # challengeResponse builds the pre-6.43 challenge response: "00" + hex(MD5(0x00 +
-# password + challengeBytes)).
+# password + challengeBytes)). The challenge is 16 bytes as 32 hex digits.
 func challengeResponse(password as string, challengeHex as string) {
+    def challenge as bytes;
+    try {
+        $challenge = encoding.fromText("hex", $challengeHex);
+    } catch (e) {
+        if ($e.kind != "encoding") {
+            throw $e;
+        }
+    }
+    if (len($challenge) != 16) {
+        fail("login challenge is not 32 hex digits");
+    }
     def input as bytes;
     $input[] = 0;
-    $input = appendBytes($input, encoding.encode("utf-8", $password));
-    $input = appendBytes($input, encoding.fromText("hex", $challengeHex));
+    $input = binary.concat($input, encoding.encode("utf-8", $password));
+    $input = binary.concat($input, $challenge);
     return "00" + encoding.toText("hex", hash.compute("md5", $input));
 }
 
@@ -639,7 +926,8 @@ func login(session as Session, user as string, password as string) {
  * the password would cross the network in the clear.
  * @param opts {Options} the connection options
  * @return {Session} the logged-in session
- * @throws {MikrotikError} kind "mikrotik" on a login failure, or plain TCP without allowInsecureAuth
+ * @throws {MikrotikError} kind "mikrotik" on a login failure, or plain TCP
+ *   without allowInsecureAuth
  */
 export func connect(opts as Options) {
     if (not $opts.tls and not $opts.allowInsecureAuth) {
@@ -657,14 +945,17 @@ export func connect(opts as Options) {
         def tlsOpts as net.TLSOptions;
         $tlsOpts.skipVerify = $opts.skipVerify;
         $tlsOpts.caCert = $opts.caCert;
-        $socket = net.connectTLS($addr, $tlsOpts, CONNECT_TIMEOUT_MS);
+        $socket = net.connectWith(
+            $addr,
+            net.ConnectOptions{timeoutMs: CONNECT_TIMEOUT_MS, tls: true, tlsOptions: $tlsOpts});
     } else {
-        $socket = net.connect($addr, CONNECT_TIMEOUT_MS);
+        $socket = net.connectWith($addr, net.ConnectOptions{timeoutMs: CONNECT_TIMEOUT_MS});
     }
-    def session as Session init Session{socket: $socket};
     # A refused login must not leak the socket; on success the caller owns the
     # open session.
     errdefer net.close($socket);
+    net.setIdleTimeout($socket, IDLE_TIMEOUT_MS);
+    def session as Session init newSession($socket);
     login($session, $opts.user, $opts.password);
     return $session;
 }
@@ -748,10 +1039,11 @@ export func run(session as Session, command as string, attrs as map of string to
 
 /**
  * Like `talk`, but attaches a `.tag=<id>` word so the router echoes the tag on
- * every reply, letting a caller correlate this command's replies. Pass `tag: ""`
- * to auto-generate a unique tag. The reply is still collected to `!done` (a
- * one-shot command); for a command that pushes replies over time use `listen` +
- * `receiveReply`.
+ * every reply. Only the replies carrying the tag are collected; replies of other
+ * tags (a running `listen` stream) read on the way are held for their reader.
+ * Pass `tag: ""` to auto-generate a unique tag. The reply is still collected to
+ * `!done` (a one-shot command); for a command that pushes replies over time use
+ * `listen` + `receiveReply`.
  * @param session {Session} the session
  * @param command {string} the API command (e.g. "/interface/print")
  * @param attrs {map of string to string} attribute words ({} for none)
@@ -766,8 +1058,8 @@ export func talkTagged(
     tag as string) {
     def t as string init resolveTag($tag);
     def noq as list of string init [];
-    writeSentence($session.socket, buildTaggedWords($command, $attrs, $noq, $t));
-    return collectReply($session).rows;
+    def words as list of string init buildTaggedWords($command, $attrs, $noq, $t);
+    return exchangeWithin($session, $words, $t, replyBudget(), EXCHANGE_TIMEOUT_MS).rows;
 }
 
 /**
@@ -784,80 +1076,141 @@ export func talkTagged(
 export func listen(session as Session, command as string, params as map of string to string) {
     def tag as string init uuid.v4();
     def noq as list of string init [];
-    writeSentence($session.socket, buildTaggedWords($command, $params, $noq, $tag));
+    send($session, buildTaggedWords($command, $params, $noq, $tag));
     return $tag;
 }
 
 /**
  * Block until the next pushed reply for `tag` arrives and return it as a
- * `=key=value` field map. Returns an **empty map** when the stream has ended (a
- * `!done` for the tag - e.g. after `cancel`), which is the loop's stop signal.
- * Replies carrying a different tag are skipped (they belong to another stream on
- * the same session). A `cancel`-induced `!trap` (category `2`, interrupted) is
- * absorbed; any other `!trap` / `!fatal` throws.
+ * `=key=value` field map; `receiveReplyWithin` with a 30-second wait.
  * @param session {Session} the session
  * @param tag {string} the stream tag returned by `listen`
  * @return {map of string to string} the next reply's fields, or {} at stream end
  * @throws {MikrotikError} kind "mikrotik" on a genuine !trap / !fatal reply
  */
 export func receiveReply(session as Session, tag as string) {
-    def result as map of string to string init {};
-    def found as bool init false;
-    def ended as bool init false;
-    repeat {
-        def sentence as list of string init readSentence($session.socket);
-        def reply as string init "";
-        if (len($sentence) > 0) {
-            $reply = $sentence[0];
+    return receiveReplyWithin($session, $tag, CONNECT_TIMEOUT_MS);
+}
+
+/**
+ * Wait up to `timeoutMs` for the next pushed reply for `tag` and return it as a
+ * `=key=value` field map. Returns an **empty map** when the stream has ended (a
+ * `!done` for the tag - e.g. after `cancel`), which is the loop's stop signal.
+ * Replies of other tags read on the way are held for their reader. A
+ * `cancel`-induced `!trap` (category `2`, interrupted) is absorbed; any other
+ * `!trap` of the tag, or a `!fatal`, throws. When nothing arrives in time it
+ * throws kind `"timeout"` and the session stays usable (call again, or
+ * `cancel`); once a reply has begun it must arrive within the exchange deadline.
+ * @param session {Session} the session
+ * @param tag {string} the stream tag returned by `listen`
+ * @param timeoutMs {int} how long to wait in ms; 0 waits without a limit
+ * @return {map of string to string} the next reply's fields, or {} at stream end
+ * @throws {MikrotikError} kind "mikrotik" on a genuine !trap / !fatal reply or a
+ *   negative timeout
+ */
+export func receiveReplyWithin(session as Session, tag as string, timeoutMs as int) {
+    if ($timeoutMs < 0) {
+        fail("timeoutMs must be >= 0, got {$timeoutMs}");
+    }
+    def all as bool init len($tag) == 0;
+    def endAt as int init time.unixMilliseconds(time.now()) + $timeoutMs;
+    while (true) {
+        def held as Taken init takeHeld($session, $tag, $all);
+        def s as Sentence;
+        if ($held.found) {
+            $s = $held.sentence;
+        } else {
+            $s = waitSentence($session, $timeoutMs, $endAt);
         }
-        def rtag as string init parseTag($sentence);
-        def mine as bool init (len($tag) == 0 or $rtag == $tag);
-        if ($reply == "!re") {
-            if ($mine) {
-                $result = parseFields($sentence);
-                $found = true;
+        if ($all or $s.tag == $tag) {
+            def reply as string init $s.words[0];
+            def fields as map of string to string init parseFields($s.words);
+            if ($reply == "!fatal") {
+                abandon($session);
+                replyError("fatal", $fields);
             }
-        } elseif ($reply == "!done") {
-            if ($mine) {
-                $ended = true;
+            if ($s.bad != "") {
+                throw notUtf8($s.bad);
             }
-        } elseif ($reply == "!trap") {
-            def fields as map of string to string init parseFields($sentence);
-            def cat as string init "";
-            if (maps.has($fields, "category")) {
-                $cat = $fields["category"];
+            if ($reply == "!re") {
+                return $fields;
+            }
+            if ($reply == "!done") {
+                return {};
             }
             # A cancel interrupts the streaming command with a trap of category
             # 2 (interrupted); it is normal end-of-stream, not an error, so keep
             # reading for the trailing !done.
-            if ($cat != "2") {
+            if ($reply == "!trap" and fieldOr($fields, "category") != "2") {
                 replyError("trap", $fields);
             }
-        } elseif ($reply == "!fatal") {
-            replyError("fatal", parseFields($sentence));
+        } elseif ($s.words[0] == "!fatal") {
+            abandon($session);
+            replyError("fatal", parseFields($s.words));
+        } elseif (not strings.startsWith($s.tag, CANCEL_TAG_PREFIX)) {
+            hold($session, $s);
         }
-    } until ($found or $ended);
-    return $result;
+    }
+}
+
+# waitSentence reads the next sentence off the wire: it waits for its first
+# byte until `until` (ms since the epoch; none when `timeoutMs` is 0), then
+# reads the rest within the exchange deadline. Nothing is consumed by a timeout
+# while waiting, so the session stays usable; a failure after the first byte
+# abandons it.
+func waitSentence(session as Session, timeoutMs as int, endAt as int) {
+    def socket as net.Conn init $session.socket;
+    def wait as int init 0;
+    if ($timeoutMs > 0) {
+        $wait = $endAt - time.unixMilliseconds(time.now());
+        if ($wait <= 0) {
+            throw Error{kind: "timeout", message: "mikrotik: no reply within {$timeoutMs} ms"};
+        }
+    }
+    def head as int init -1;
+    try {
+        net.setIdleTimeout($socket, 0);
+        net.setReadDeadline($socket, $wait);
+        $head = readN($socket, 1)[0];
+    } catch (e) {
+        if ($e.kind != "timeout" and $e.kind != "cancelled") {
+            abandon($session);
+        }
+        throw $e;
+    }
+    try {
+        net.setIdleTimeout($socket, IDLE_TIMEOUT_MS);
+        net.setReadDeadline($socket, EXCHANGE_TIMEOUT_MS);
+        def s as Sentence init readSentenceAfter($socket, replyBudget(), $head);
+        net.setReadDeadline($socket, 0);
+        return $s;
+    } catch (e) {
+        abandon($session);
+        throw $e;
+    }
 }
 
 /**
  * Stop a streaming command started with `listen` by issuing `/cancel` naming its
  * tag. Fire-and-forget: the resulting `!trap` (interrupted) and `!done` for the
- * stream, plus the `/cancel`'s own reply, are drained by the `receiveReply` loop
- * (which then returns {} and lets the loop exit).
+ * stream are read by the `receiveReply` loop (which then returns {} and lets the
+ * loop exit); the `/cancel`'s own reply is dropped.
  * @param session {Session} the session
  * @param tag {string} the stream tag returned by `listen`
  */
 export func cancel(session as Session, tag as string) {
-    writeSentence($session.socket, buildCancelWords($tag));
+    def words as list of string init buildCancelWords($tag);
+    $words[] = ".tag=" + CANCEL_TAG_PREFIX + uuid.v4();
+    send($session, $words);
 }
 
 /**
- * Close the session's connection.
+ * Close the session's connection. Closing a session that a failure already
+ * closed does nothing.
  * @param session {Session} the session
  */
 export func close(session as Session) {
-    net.close($session.socket);
+    abandon($session);
 }
 
 /**

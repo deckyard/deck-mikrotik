@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # SPDX-FileCopyrightText: Copyright (C) 2026 mplx <mplx@jennifer-lang.dev>
-# pragma-jennifer-version: >=0.27.0
+# pragma-jennifer-version: >=0.28.0
 
 /**
  * White-box tests for the entry module: jennifer test src/mikrotik_test.j
@@ -610,10 +610,12 @@ func tlsLogin(srv as httpd.Server, o as Options) {
 }
 
 func testApiSslVerifiesTheCertificate() {
-    def srv as httpd.Server init httpd.listenTLS(
+    def srv as httpd.Server init httpd.listenWith(
         "127.0.0.1:0",
-        encoding.encode("utf-8", TEST_LEAF),
-        encoding.encode("utf-8", TEST_LEAF_KEY));
+        httpd.Options{
+            certPem: encoding.encode("utf-8", TEST_LEAF),
+            keyPem: encoding.encode("utf-8", TEST_LEAF_KEY)
+        });
     defer httpd.shutdown($srv);
     def base as Options init optionsTLS("127.0.0.1", "admin", "pw\r\n\r\n");
     # the system roots lack the test CA
